@@ -1,0 +1,672 @@
+'use client';
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { addDays, endOfMonth, format, addMonths } from 'date-fns';
+import { toast } from 'sonner';
+import {
+  ArrowLeft, CalendarDays, Check, ChevronDown, FileCheck, FileText, GripVertical, Info,
+  Plus, ScanLine, Search, Settings2, Sparkles, X, Zap,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Calendar } from '@/components/ui/calendar';
+import { createInvoiceCustomer as createInvoiceCustomerRequest, createInvoiceCustomerFromAdmission, fetchInvoiceCustomers, getPaymentNumberPreview, getInvoiceRecord, InvoiceCustomer, saveInvoice as saveInvoiceRequest, sendInvoiceEmail, updateInvoiceRecord } from '@/lib/api/invoice-api';
+import { getInvoiceProductCatalog, InvoiceProductItem, ProposalMatch, RequiredCapacity } from '@/server/actions/invoice-catalog-actions';
+import { PaymentNumberSettingsDialog } from '@/components/invoice/invoice-payments';
+import { PageContainer, PageHeader } from '@/components/ui/page-header';
+import { InvoiceStatus } from '@/types/invoice';
+
+type Customer = InvoiceCustomer;
+type InvoiceItem = { id: number; description: string; quantity: number; rate: number; discount: number; rateLocked?: boolean };
+
+const terms = ['Due on Receipt', 'Net 15', 'Net 30', 'Net 45', 'Net 60', 'Due end of month', 'Due end of next month', 'Custom'];
+const currency = (amount: number) => `₹${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const blankItem = (id: number): InvoiceItem => ({ id, description: '', quantity: 1, rate: 0, discount: 0 });
+
+function Section({ title, children, action }: { title: string; children: React.ReactNode; action?: React.ReactNode }) {
+  return <section className="overflow-hidden rounded-lg border bg-card">
+    <div className="flex min-h-12 items-center justify-between border-b bg-muted/20 px-5">
+      <h2 className="text-sm font-semibold">{title}</h2>{action}
+    </div>
+    <div className="p-5">{children}</div>
+  </section>;
+}
+
+function CustomerSelect({ value, onChange, customers, loading, onNew }: { value: Customer | null; onChange: (customer: Customer | null) => void; customers: Customer[]; loading: boolean; onNew: () => void }) {
+  const [search, setSearch] = useState('');
+  const filtered = customers.filter((customer) => `${customer.name} ${customer.email} ${customer.phone}`.toLowerCase().includes(search.toLowerCase()));
+  return <div className="space-y-3">
+    <Popover>
+      <PopoverTrigger asChild><Button variant="outline" className="h-10 w-full justify-between font-normal text-muted-foreground">
+        <span className="flex items-center gap-2">{value ? <><span className="flex size-6 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">{value.name[0]}</span><span className="text-foreground">{value.name}</span></> : <><Search className="size-4" /> Select or search a customer</>}</span><ChevronDown className="size-4" />
+      </Button></PopoverTrigger>
+      <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
+        <div className="border-b p-2"><div className="relative"><Search className="absolute left-2.5 top-2.5 size-4 text-muted-foreground" /><Input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search customers" className="pl-8" /></div></div>
+        <div className="max-h-56 overflow-auto p-1">{loading ? <p className="px-3 py-6 text-center text-sm text-muted-foreground">Loading customers…</p> : filtered.length ? filtered.map((customer) => <button type="button" key={customer.id} onClick={() => { onChange(customer); setSearch(''); }} className="flex w-full items-center justify-between rounded-md px-3 py-2.5 text-left text-sm hover:bg-muted"><span><span className="block font-medium">{customer.name}</span><span className="text-xs text-muted-foreground">{[customer.email, customer.phone, customer.sourceType === 'admission' ? 'Admission' : customer.sourceType === 'enquiry' ? 'Enquiry' : 'Customer'].filter(Boolean).join(' · ')}</span></span>{value?.id === customer.id && <Check className="size-4 text-primary" />}</button>) : <p className="px-3 py-6 text-center text-sm text-muted-foreground">No matching customers.</p>}</div>
+        <div className="border-t p-2"><Button type="button" variant="outline" className="w-full" onClick={onNew}><Plus className="size-4" /> New Customer</Button></div>
+      </PopoverContent>
+    </Popover>
+    {value && <div className="grid gap-3 sm:grid-cols-2">
+      {[['Billing Address', value.address || 'No billing address saved'], ['Shipping Address', value.address || 'Same as billing address']].map(([label, address]) => <div key={label} className="rounded-md border bg-muted/10 p-3"><div className="mb-2 text-xs font-medium text-muted-foreground">{label}</div><p className="text-sm leading-5">{address}</p></div>)}
+    </div>}
+  </div>;
+}
+
+function InvoiceItemRow({ item, catalog, onChange, onRemove, onEnter }: { item: InvoiceItem; catalog: InvoiceProductItem[]; onChange: (item: InvoiceItem) => void; onRemove: () => void; onEnter: () => void }) {
+  const amount = item.quantity * item.rate * (1 - item.discount / 100);
+  const capacities = useMemo(() => catalog.filter((c) => c.category === 'capacity' && !c.id.startsWith('course-full-')), [catalog]);
+  const proposals = useMemo(() => catalog.filter((c) => c.category === 'proposal'), [catalog]);
+  const otherItems = useMemo(() => catalog.filter((c) => c.category !== 'capacity' && c.category !== 'proposal'), [catalog]);
+
+  return <tr className="border-b last:border-0">
+    <td className="min-w-[300px] px-3 py-2"><div className="flex items-start gap-2"><GripVertical className="mt-2 size-4 shrink-0 text-muted-foreground/50" /><div className="flex size-10 shrink-0 items-center justify-center rounded border bg-muted/30 text-muted-foreground"><FileText className="size-4" /></div><div className="min-w-0 flex-1 space-y-1"><select aria-label="Required capacity or product item" value="" onChange={(e) => { const entry = catalog.find((candidate) => candidate.id === e.target.value); if (entry) onChange({ ...item, description: entry.description || entry.name, rate: entry.price, rateLocked: entry.category === 'capacity', ...(entry.quantity && entry.quantity > 0 ? { quantity: entry.quantity } : {}) }); }} className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs"><option value="">{catalog.length ? '⚡ Choose Required Capacity or Item (optional)' : 'Enter a custom item'}</option>{capacities.length > 0 && <optgroup label="⚡ Required Capacities (Admin Data Management)">{capacities.map((entry) => <option key={entry.id} value={entry.id}>{entry.name} · {currency(entry.price)}</option>)}</optgroup>}{proposals.length > 0 && <optgroup label="📄 Proposal Line Items (from Enquiries)">{proposals.map((entry) => <option key={entry.id} value={entry.id}>{entry.name} · {currency(entry.price)}</option>)}</optgroup>}{otherItems.length > 0 && <optgroup label="📦 Other Catalog Items">{otherItems.map((entry) => <option key={entry.id} value={entry.id}>{entry.name} · {currency(entry.price)}</option>)}</optgroup>}</select><Textarea value={item.description} onChange={(e) => onChange({ ...item, description: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onEnter(); } }} placeholder="Required solar capacity package, specifications, or proposal item" className="min-h-12 resize-y text-xs" /></div></div></td>
+    <td className="min-w-24 px-2"><Input aria-label="Quantity" type="number" min="1" step="1" value={item.quantity} onChange={(e) => onChange({ ...item, quantity: Number(e.target.value) })} className="h-9 text-right" /></td>
+    <td className="min-w-28 px-2"><div className="relative"><span className="absolute left-2.5 top-2 text-sm text-muted-foreground">₹</span><Input aria-label="Rate" type="number" min="0" step="0.01" value={item.rate || ''} onChange={(e) => onChange({ ...item, rate: Number(e.target.value) })} disabled={item.rateLocked} className="h-9 pl-6 text-right" /></div></td>
+    <td className="min-w-24 px-2"><div className="relative"><Input aria-label="Discount percentage" type="number" min="0" max="100" value={item.discount || ''} onChange={(e) => onChange({ ...item, discount: Number(e.target.value) })} className="h-9 pr-7 text-right" /><span className="absolute right-2.5 top-2 text-xs text-muted-foreground">%</span></div></td>
+    <td className="min-w-28 px-3 text-right text-sm font-medium tabular-nums">{currency(amount)}</td><td className="px-2"><Button type="button" size="icon" variant="ghost" aria-label="Remove item" onClick={onRemove} className="size-8 text-muted-foreground"><X className="size-4" /></Button></td>
+  </tr>;
+}
+
+function TotalsPanel({ subtotal, taxPercent, setTaxPercent, taxAmount, discount, setDiscount, discountMode, setDiscountMode, shipping, setShipping, adjustment, setAdjustment, withholdingAmount, setWithholdingAmount, withholdingType, setWithholdingType, total, amountReceived, balanceDue }: { subtotal: number; taxPercent: number; setTaxPercent: (value: number) => void; taxAmount: number; discount: number; setDiscount: (value: number) => void; discountMode: 'percent' | 'amount'; setDiscountMode: (value: 'percent' | 'amount') => void; shipping: number; setShipping: (value: number) => void; adjustment: number; setAdjustment: (value: number) => void; withholdingAmount: number; setWithholdingAmount: (value: number) => void; withholdingType: 'TDS' | 'TCS' | null; setWithholdingType: (value: 'TDS' | 'TCS' | null) => void; total: number; amountReceived: number; balanceDue: number }) {
+  return <div className="ml-auto max-w-md rounded-lg border bg-muted/20 p-5">
+    <div className="space-y-3 text-sm">
+      <div className="flex justify-between"><span className="text-muted-foreground">Sub Total</span><span className="tabular-nums">{currency(subtotal)}</span></div>
+      <div className="flex items-center justify-between gap-3"><span className="text-muted-foreground">Discount</span><div className="flex w-40"><Input aria-label="Discount" type="number" value={discount || ''} onChange={(e) => setDiscount(Number(e.target.value))} className="h-8 rounded-r-none text-right" /><button type="button" className="rounded-r-md border border-l-0 bg-background px-2 text-xs" onClick={() => setDiscountMode(discountMode === 'percent' ? 'amount' : 'percent')}>{discountMode === 'percent' ? '%' : '₹'}</button></div></div>
+      <div className="flex items-center justify-between gap-3"><span className="text-muted-foreground">Tax ({taxPercent.toFixed(2)}%)</span><div className="flex w-40 items-center gap-2"><Input aria-label="Invoice tax percentage" type="number" min="0" max="100" step="0.01" value={taxPercent} onChange={(e) => setTaxPercent(Math.min(100, Math.max(0, Number(e.target.value))))} className="h-8 pr-7 text-right" /><span className="-ml-8 text-xs text-muted-foreground">%</span><span className="min-w-24 text-right tabular-nums">{currency(taxAmount)}</span></div></div>
+      <div className="flex items-center justify-between gap-3"><span className="flex items-center gap-1 text-muted-foreground">Shipping Charges <Info className="size-3.5" /></span><Input aria-label="Shipping charges" type="number" value={shipping || ''} onChange={(e) => setShipping(Number(e.target.value))} className="h-8 w-40 text-right" /></div>
+      <div className="flex items-center justify-between gap-3"><span className="text-muted-foreground">Other Charges</span><Input aria-label="Other charges" type="number" value={adjustment || ''} onChange={(e) => setAdjustment(Number(e.target.value))} className="h-8 w-40 text-right" /></div>
+      <div className="grid gap-2 border-t pt-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"><label htmlFor="withholding-type" className="text-muted-foreground">Withholding</label><div className="flex gap-2"><select id="withholding-type" aria-label="Withholding type" value={withholdingType || 'none'} onChange={(e) => { const nextType = e.target.value === 'TDS' || e.target.value === 'TCS' ? e.target.value : null; setWithholdingType(nextType); if (!nextType) setWithholdingAmount(0); }} className="h-8 rounded-md border border-input bg-background px-2 text-xs"><option value="none">None</option><option value="TDS">TDS</option><option value="TCS">TCS</option></select><Input aria-label="Withholding amount" type="number" min="0" step="0.01" value={withholdingAmount || ''} onChange={(e) => setWithholdingAmount(Number(e.target.value))} className="h-8 w-32 text-right" /></div></div>
+      <div className="flex items-center justify-between border-t pt-3"><span className="font-semibold">Total</span><span className="text-xl font-semibold tabular-nums">{currency(total)}</span></div>
+      <div className="flex items-center justify-between text-xs"><span className="text-muted-foreground">Amount Received</span><span className="tabular-nums">{currency(amountReceived)}</span></div>
+      <div className="flex items-center justify-between font-medium"><span>Balance Due</span><span className="tabular-nums">{currency(balanceDue)}</span></div>
+      <p className="text-right text-[11px] text-muted-foreground">{currency(total)} INR</p>
+    </div>
+  </div>;
+}
+
+export function NewInvoiceForm({ mode = 'create', invoiceId }: { mode?: 'create' | 'edit'; invoiceId?: string }) {
+  const router = useRouter();
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [catalog, setCatalog] = useState<InvoiceProductItem[]>([]);
+  const [requiredCapacities, setRequiredCapacities] = useState<RequiredCapacity[]>([]);
+  const [capacitiesOpen, setCapacitiesOpen] = useState(false);
+  const [matchingProposals, setMatchingProposals] = useState<ProposalMatch[]>([]);
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const [receivedPayment, setReceivedPayment] = useState(false);
+  const [receivedAmount, setReceivedAmount] = useState('');
+  const [receivedAmountEdited, setReceivedAmountEdited] = useState(false);
+  const [receivedMode, setReceivedMode] = useState('UPI');
+  const [receivedDepositTo, setReceivedDepositTo] = useState('');
+  const [receivedDate, setReceivedDate] = useState(format(new Date(), 'yyyy-MM-dd'));
+  const [receivedReference, setReceivedReference] = useState('');
+  const [receivedPaymentNumber, setReceivedPaymentNumber] = useState('');
+  const [paymentAutoGenerate, setPaymentAutoGenerate] = useState(true);
+  const [paymentSettingsOpen, setPaymentSettingsOpen] = useState(false);
+  const [customersLoading, setCustomersLoading] = useState(true);
+  const [customer, setCustomer] = useState<Customer | null>(null);
+  const [newCustomerOpen, setNewCustomerOpen] = useState(false);
+  const [invoiceNumber, setInvoiceNumber] = useState('');
+  const [invoiceStatus, setInvoiceStatus] = useState<InvoiceStatus>(InvoiceStatus.DRAFT);
+  const [invoiceHasPayments, setInvoiceHasPayments] = useState(false);
+  const [invoiceLoading, setInvoiceLoading] = useState(mode === 'edit');
+  const [editingInvoice, setEditingInvoice] = useState<Record<string, any> | null>(null);
+  const initializedInvoiceId = useRef<string | null>(null);
+  const [invoiceDate, setInvoiceDate] = useState<Date>(new Date());
+  const [dueDate, setDueDate] = useState<Date | null>(addDays(new Date(), 30));
+  const [term, setTerm] = useState('Net 30');
+  const [items, setItems] = useState<InvoiceItem[]>([blankItem(1)]);
+  const [nextId, setNextId] = useState(2);
+  const [discount, setDiscount] = useState(0);
+  const [discountMode, setDiscountMode] = useState<'percent' | 'amount'>('percent');
+  const [taxPercent, setTaxPercent] = useState(0);
+  const [shipping, setShipping] = useState(0);
+  const [adjustment, setAdjustment] = useState(0);
+  const [withholdingAmount, setWithholdingAmount] = useState(0);
+  const [withholdingType, setWithholdingType] = useState<'TDS' | 'TCS' | null>(null);
+  const [gstin, setGstin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [errors, setErrors] = useState(false);
+  const [preferencesOpen, setPreferencesOpen] = useState(false);
+  const [sendOpen, setSendOpen] = useState(false);
+  const [createdId, setCreatedId] = useState<string | null>(null);
+  const [sendEmail, setSendEmail] = useState('');
+  const [subject, setSubject] = useState('');
+  const [customerNotes, setCustomerNotes] = useState('Thanks for your business.');
+  const [invoiceTerms, setInvoiceTerms] = useState('');
+  const [numberMode, setNumberMode] = useState<'auto' | 'manual'>('auto');
+  const subtotal = useMemo(() => items.reduce((sum, item) => sum + item.quantity * item.rate * (1 - item.discount / 100), 0), [items]);
+  const discountAmount = Math.min(subtotal, discountMode === 'percent' ? subtotal * discount / 100 : discount);
+  const taxableSubtotal = Math.max(0, subtotal - discountAmount);
+  const taxAmount = taxableSubtotal * taxPercent / 100;
+  const effectiveWithholdingAmount = Math.min(taxableSubtotal, withholdingAmount);
+  const payableTotal = Math.max(0, taxableSubtotal + taxAmount + shipping + adjustment - effectiveWithholdingAmount);
+  const hasDescription = items.some((item) => item.description.trim() && Number.isInteger(item.quantity) && item.quantity > 0);
+  useEffect(() => {
+    let active = true;
+    Promise.allSettled([fetchInvoiceCustomers(), getInvoiceProductCatalog()])
+      .then(([customerResult, catalogResult]) => {
+        if (!active) return;
+        if (customerResult.status === 'fulfilled') setCustomers(customerResult.value);
+        else toast.error(customerResult.reason instanceof Error ? customerResult.reason.message : 'Could not load customers.');
+        if (catalogResult.status === 'fulfilled') {
+          setCatalog(catalogResult.value.catalog);
+          setRequiredCapacities(catalogResult.value.requiredCapacities || []);
+          setMatchingProposals(catalogResult.value.matchingProposals);
+        } else {
+          toast.error(catalogResult.reason instanceof Error ? catalogResult.reason.message : 'Could not load solar product catalog.');
+        }
+      })
+      .finally(() => { if (active) setCustomersLoading(false); });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (mode !== 'edit' || !invoiceId) return;
+    let active = true;
+    getInvoiceRecord(invoiceId).then((record) => { if (active) setEditingInvoice(record); }).catch((error) => {
+      if (!active) return;
+      toast.error(error instanceof Error ? error.message : 'Could not load invoice.');
+      setInvoiceLoading(false);
+    });
+    return () => { active = false; };
+  }, [mode, invoiceId]);
+
+  useEffect(() => {
+    if (mode !== 'edit' || !editingInvoice || customersLoading || initializedInvoiceId.current === invoiceId) return;
+    const currentCustomer = editingInvoice.customer as Record<string, any> | null;
+    let selectedCustomer: InvoiceCustomer | null = currentCustomer ? customers.find((entry) => entry.id === currentCustomer.id) || null : null;
+    if (!selectedCustomer && currentCustomer) {
+      selectedCustomer = {
+        id: currentCustomer.id,
+        name: currentCustomer.name || String(editingInvoice.billedTo || '').split('\n')[0],
+        email: currentCustomer.email || '', phone: currentCustomer.phone || '', address: currentCustomer.address || '',
+        state: currentCustomer.state || '', gstin: currentCustomer.gstin || '', savedCustomer: true,
+      };
+      setCustomers((current) => [...current, selectedCustomer!]);
+    }
+    setCustomer(selectedCustomer);
+    setGstin(currentCustomer?.gstin || '');
+    setInvoiceNumber(String(editingInvoice.invoiceNumber || ''));
+    setNumberMode('manual');
+    setInvoiceDate(new Date(editingInvoice.invoiceDate));
+    setDueDate(editingInvoice.dueDate ? new Date(editingInvoice.dueDate) : null);
+    setTerm('Custom');
+    const savedItems = (editingInvoice.items || []).map((item: Record<string, any>, index: number) => ({ id: index + 1, description: String(item.itemDescription || ''), quantity: Number(item.quantity) || 1, rate: Number(item.unitPrice) || 0, discount: 0 }));
+    setItems(savedItems.length ? savedItems : [blankItem(1)]);
+    setNextId(savedItems.length + 1);
+    setDiscount(Number(editingInvoice.discountAmount) || 0);
+    setDiscountMode('amount');
+    setTaxPercent((Number(editingInvoice.taxRate) || 0) * 100);
+    setShipping(Number(editingInvoice.serviceCharge) || 0);
+    setAdjustment(Number(editingInvoice.otherCharges) || 0);
+    setWithholdingAmount(Number(editingInvoice.withholdingAmount) || 0);
+    setWithholdingType(editingInvoice.withholdingType === 'TDS' || editingInvoice.withholdingType === 'TCS' ? editingInvoice.withholdingType : null);
+    setInvoiceStatus((editingInvoice.status as InvoiceStatus) || InvoiceStatus.DRAFT);
+    setInvoiceHasPayments(Number(editingInvoice.amountPaid) > 0 || Boolean(editingInvoice.payments?.length));
+    setSubject('');
+    setCustomerNotes(String(editingInvoice.notes || ''));
+    setInvoiceTerms('');
+    initializedInvoiceId.current = invoiceId || null;
+    setInvoiceLoading(false);
+  }, [mode, editingInvoice, customers, customersLoading, invoiceId]);
+
+  useEffect(() => {
+    if (!customer) return;
+    let active = true;
+    getInvoiceProductCatalog({
+      id: customer.id,
+      name: customer.name,
+      phone: customer.phone,
+      email: customer.email,
+      sourceType: customer.sourceType,
+    }).then((res) => {
+      if (!active) return;
+      if (res.catalog?.length) setCatalog(res.catalog);
+      if (res.requiredCapacities?.length) setRequiredCapacities(res.requiredCapacities);
+      if (res.matchingProposals) setMatchingProposals(res.matchingProposals);
+    }).catch((err) => {
+      console.warn('Could not refresh customer proposal catalog:', err);
+    });
+    return () => { active = false; };
+  }, [customer]);
+
+  const handleSelectCapacity = (cap: RequiredCapacity) => {
+    const brandStr = cap.brand ? ` (${cap.brand})` : '';
+    const emptyRowIndex = items.findIndex((it) => !it.description.trim());
+    const system: InvoiceItem = {
+      id: emptyRowIndex !== -1 ? items[emptyRowIndex].id : nextId,
+      description: `${cap.name} On-Grid Solar System${brandStr} with Tier-1 Panels`,
+      quantity: 1,
+      rate: cap.courseFee,
+      discount: 0,
+      rateLocked: true,
+    };
+    const added: InvoiceItem[] = [system];
+    if (cap.admissionFee > 0) added.push({
+      id: emptyRowIndex !== -1 ? nextId : nextId + 1,
+      description: `${cap.name} KSEB Net Metering, Feasibility & Testing Fee`,
+      quantity: 1,
+      rate: cap.admissionFee,
+      discount: 0,
+      rateLocked: true,
+    });
+    setItems((current) => emptyRowIndex !== -1
+      ? [...current.slice(0, emptyRowIndex), ...added, ...current.slice(emptyRowIndex + 1)]
+      : [...current, ...added]);
+    setNextId((id) => id + added.length);
+    toast.success(`Added ${cap.name} System Price${cap.admissionFee > 0 ? ' and KSEB Fee' : ''} line items.`);
+    setCapacitiesOpen(false);
+  };
+  useEffect(() => {
+    if (receivedPayment && !receivedAmountEdited) setReceivedAmount(payableTotal.toFixed(2));
+  }, [receivedPayment, receivedAmountEdited, payableTotal]);
+  const changeTerm = (value: string) => {
+    setTerm(value);
+    const days = Number(value.replace('Net ', ''));
+    if (value === 'Due on Receipt') setDueDate(invoiceDate);
+    else if (value === 'Due end of month') setDueDate(endOfMonth(invoiceDate));
+    else if (value === 'Due end of next month') setDueDate(endOfMonth(addMonths(invoiceDate, 1)));
+    else if (Number.isFinite(days) && days > 0) setDueDate(addDays(invoiceDate, days));
+  };
+  const updateItem = (changed: InvoiceItem) => setItems((current) => current.map((item) => item.id === changed.id ? changed : item));
+  const appendRow = () => { setItems((current) => [...current, blankItem(nextId)]); setNextId((id) => id + 1); };
+  const handleScannedItem = useCallback((value: string): boolean => {
+    const normalized = value.trim().toLocaleLowerCase();
+    const match = catalog.find((entry) => entry.id.toLocaleLowerCase() === normalized || entry.name.trim().toLocaleLowerCase() === normalized);
+    if (!match) { toast.error('No active catalog item matches this scan. Match the barcode value to a catalog item name or ID.'); return false; }
+    const empty = items.find((entry) => !entry.description.trim());
+    if (empty) updateItem({ ...empty, description: match.name, rate: match.price });
+    else { setItems((current) => [...current, { ...blankItem(nextId), description: match.name, rate: match.price }]); setNextId((id) => id + 1); }
+    toast.success(`${match.name} added to the invoice.`);
+    return true;
+  }, [catalog, items, nextId]);
+  const leaveDestination = mode === 'edit' && invoiceId ? `/invoices/${invoiceId}` : '/invoices';
+  const askLeave = (destination: string) => { if (window.confirm('Discard your unsaved invoice changes?')) router.push(destination); };
+  const saveInvoice = async (creationStatus: 'DRAFT' | 'SENT') => {
+    setErrors(true);
+    if (!customer || !hasDescription) { toast.error(!customer ? 'Select a customer before saving.' : 'Add at least one item with a description.'); return; }
+    if ((mode === 'edit' || numberMode === 'manual') && !invoiceNumber.trim()) { toast.error('Enter an invoice number.'); return; }
+    if (mode === 'edit' && payableTotal < (Number(editingInvoice?.amountPaid) || 0)) { toast.error('Invoice total cannot be lower than payments already recorded.'); return; }
+    if (mode === 'create' && receivedPayment && (!Number.isFinite(Number(receivedAmount)) || Number(receivedAmount) <= 0 || Number(receivedAmount) > payableTotal)) { toast.error('Amount received must be greater than zero and no more than the invoice total.'); return; }
+    setBusy(true);
+    try {
+      let invoiceCustomer = customer;
+      if (customer.sourceType === 'admission') {
+        const saved = await createInvoiceCustomerFromAdmission(customer.id.replace(/^admission:/, ''));
+        invoiceCustomer = { id: saved.id, name: saved.name, email: saved.email ?? '', phone: saved.phone ?? '', address: saved.address ?? '', state: saved.state ?? '', gstin: saved.gstin ?? '', savedCustomer: true };
+        setCustomer(invoiceCustomer);
+        setCustomers((current) => [...current.filter((entry) => entry.id !== invoiceCustomer.id && entry.id !== customer.id), invoiceCustomer].sort((a, b) => a.name.localeCompare(b.name)));
+      }
+      if (mode === 'edit' && !invoiceCustomer.savedCustomer) {
+        const saved = await createInvoiceCustomerRequest({ name: invoiceCustomer.name, email: invoiceCustomer.email || undefined, phone: invoiceCustomer.phone || undefined, address: invoiceCustomer.address || undefined, state: invoiceCustomer.state || undefined, gstin: invoiceCustomer.gstin || undefined });
+        invoiceCustomer = { ...saved, email: saved.email || '', phone: saved.phone || '', address: saved.address || '', state: saved.state || '', gstin: saved.gstin || '', savedCustomer: true };
+        setCustomer(invoiceCustomer);
+        setCustomers((current) => [...current.filter((entry) => entry.id !== invoiceCustomer.id), invoiceCustomer].sort((a, b) => a.name.localeCompare(b.name)));
+      }
+      const billedTo = [invoiceCustomer.name, invoiceCustomer.address, invoiceCustomer.email, invoiceCustomer.phone, gstin ? `GSTIN: ${gstin}` : ''].filter(Boolean).join('\n');
+      const payload = {
+        ...(mode === 'edit' || numberMode === 'manual' ? { invoiceNumber: invoiceNumber.trim() } : {}),
+        billedTo,
+        customerId: invoiceCustomer.savedCustomer ? invoiceCustomer.id : null,
+        invoiceDate: invoiceDate.toISOString(),
+        dueDate: dueDate?.toISOString() || null,
+        notes: [subject.trim(), customerNotes.trim(), invoiceTerms.trim() ? `Terms & Conditions:\n${invoiceTerms.trim()}` : ''].filter(Boolean).join('\n\n'),
+        taxRate: taxPercent / 100,
+        discountAmount,
+        withholdingAmount,
+        withholdingType,
+        serviceCharge: shipping,
+        otherCharges: adjustment,
+        status: mode === 'edit' ? invoiceStatus : creationStatus === 'SENT' ? 'DRAFT' : creationStatus,
+        items: items.filter((entry) => entry.description.trim() && entry.quantity > 0).map((item) => ({
+          itemDescription: item.description.trim(),
+          quantity: Math.max(1, Math.round(item.quantity)),
+          unitPrice: item.rate * (1 - item.discount / 100),
+        })),
+      };
+      if (mode === 'edit' && invoiceId) {
+        await updateInvoiceRecord(invoiceId, payload);
+        toast.success('Invoice updated successfully.');
+        router.push(`/invoices/${invoiceId}`);
+        return;
+      }
+      const invoice = await saveInvoiceRequest({
+        ...payload,
+        ...(receivedPayment ? { initialPayment: {
+          amount: Number(receivedAmount || payableTotal.toFixed(2)),
+          ...(!paymentAutoGenerate ? { paymentNumber: receivedPaymentNumber.trim() } : {}),
+          paymentDate: new Date(`${receivedDate}T00:00:00`).toISOString(),
+          paymentMode: receivedMode,
+          depositTo: receivedDepositTo,
+          referenceNumber: receivedReference,
+        } } : {}),
+      });
+      setInvoiceNumber(invoice.invoiceNumber);
+      setCreatedId(invoice.id);
+      if (creationStatus === 'SENT') { setSendEmail(invoiceCustomer.email); setSendOpen(true); toast.success('Invoice saved. Review the recipient before sending.'); }
+      else { toast.success('Invoice saved as draft.'); router.push(`/invoices/${invoice.id}`); }
+    } catch (error) { toast.error(error instanceof Error ? error.message : 'Could not save invoice.'); }
+    finally { setBusy(false); }
+  };
+
+  if (invoiceLoading) return <PageContainer><div className="flex min-h-72 items-center justify-center text-sm text-muted-foreground">Loading invoice details…</div></PageContainer>;
+
+  return <PageContainer className="pb-4">
+    <PageHeader title={mode === 'edit' ? `Edit Invoice ${invoiceNumber}` : 'New Invoice'} description={mode === 'edit' ? 'Update the customer, items, pricing, dates, and invoice details.' : 'Create an invoice for a customer using solar system packages, components, and proposal items.'} actions={<Button type="button" variant="outline" onClick={() => askLeave(leaveDestination)}><ArrowLeft className="mr-2 size-4" /> {mode === 'edit' ? 'Cancel editing' : 'Back to invoices'}</Button>} />
+    <div className="space-y-5">
+      <Section title="Invoice Details">
+        <div className="grid gap-x-8 gap-y-5 lg:grid-cols-[minmax(220px,0.75fr)_minmax(0,1.5fr)]">
+          <div className="lg:col-span-2"><FieldLabel required>Customer Name</FieldLabel><CustomerSelect value={customer} customers={customers} loading={customersLoading} onNew={() => setNewCustomerOpen(true)} onChange={(selected) => { setCustomer(selected); if (selected) setGstin(selected.gstin || ''); }} />{errors && !customer && <p className="mt-1 text-xs text-destructive">Please select a customer.</p>}</div>
+          <Field label="Invoice#" required={mode === 'edit' || numberMode === 'manual'}><div className="flex gap-2"><Input value={invoiceNumber} onChange={(e) => setInvoiceNumber(e.target.value)} placeholder={numberMode === 'auto' && mode === 'create' ? 'Generated when saved' : 'Enter invoice number'} disabled={mode === 'create' && numberMode === 'auto'} />{mode === 'create' && <Button type="button" variant="outline" size="icon" aria-label="Invoice number preferences" onClick={() => setPreferencesOpen(true)}><Settings2 className="size-4" /></Button>}</div></Field>
+          <Field label="Invoice Date" required><DateInput date={invoiceDate} onChange={(date) => { if (!date) return; setInvoiceDate(date); if (term === 'Due on Receipt') setDueDate(date); }} /></Field>
+          <Field label="Terms"><select value={term} onChange={(e) => changeTerm(e.target.value)} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm">{terms.map((entry) => <option key={entry}>{entry}</option>)}</select></Field>
+          <Field label="Due Date"><DateInput date={dueDate} onChange={setDueDate} clearable /></Field>
+          {mode === 'edit' && <Field label="Invoice Status"><div><Select value={invoiceStatus} onValueChange={(value) => setInvoiceStatus(value as InvoiceStatus)} disabled={invoiceHasPayments}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{Object.values(InvoiceStatus).map((status) => <SelectItem key={status} value={status} disabled={['PAID', 'PARTIALLY_PAID'].includes(status)}>{status.replaceAll('_', ' ')}</SelectItem>)}</SelectContent></Select>{invoiceHasPayments && <p className="mt-1 text-xs text-muted-foreground">Payment status follows the recorded payments.</p>}</div></Field>}
+          <Field label="Subject" className="lg:col-span-2"><Textarea value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="Let your customer know what this Invoice is for" className="min-h-20 resize-y" /></Field>
+        </div>
+      </Section>
+      <Section title="GST Details" action={<span className="text-xs text-muted-foreground">Optional · GSTIN is not required</span>}>
+        <div className="max-w-xl"><Field label="GSTIN (optional)"><Input value={gstin} onChange={(e) => setGstin(e.target.value)} placeholder="Enter GSTIN" /></Field></div>
+      </Section>
+      <Section
+        title="Required Capacities & Invoice Items"
+        action={
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setCapacitiesOpen(true)}
+              className="gap-1.5 text-xs font-medium border-amber-300 dark:border-amber-700 hover:bg-amber-50 dark:hover:bg-amber-950/40 text-foreground"
+            >
+              <Zap className="size-3.5 text-amber-500 fill-amber-500" />
+              Required Capacities ({requiredCapacities.length})
+            </Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => setScannerOpen(true)}>
+              <ScanLine className="mr-2 size-4" />Scan item
+            </Button>
+          </div>
+        }
+      >
+        {matchingProposals.length > 0 && (
+          <div className="mb-4 rounded-lg border border-primary/20 bg-primary/5 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+                  <Sparkles className="size-5" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-semibold text-foreground">
+                    Proposal Found for {customer?.name || 'Customer'}
+                  </h4>
+                  <p className="text-xs text-muted-foreground">
+                    {matchingProposals[0].proposalNo ? `Proposal #${matchingProposals[0].proposalNo} · ` : ''}
+                    {matchingProposals[0].items.length} item{matchingProposals[0].items.length === 1 ? '' : 's'} · {currency(matchingProposals[0].totalAmount)}
+                  </p>
+                </div>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => {
+                  const prop = matchingProposals[0];
+                  if (prop.items.length > 0) {
+                    setItems(prop.items.map((it, idx) => ({
+                      id: idx + 1,
+                      description: it.description,
+                      quantity: it.quantity || 1,
+                      rate: it.unitPrice || 0,
+                      discount: 0,
+                    })));
+                    setNextId(prop.items.length + 1);
+                    toast.success(`Loaded ${prop.items.length} item(s) from proposal ${prop.proposalNo}.`);
+                  }
+                }}
+              >
+                <FileCheck className="size-4" />
+                Apply Proposal Items
+              </Button>
+            </div>
+          </div>
+        )}
+        <div className="overflow-x-auto"><table className="w-full min-w-[870px] border-separate border-spacing-0"><thead><tr className="bg-muted/35 text-left text-[11px] font-semibold text-muted-foreground"><th className="px-3 py-3">ITEM DETAILS</th><th className="px-2">QUANTITY</th><th className="px-2">RATE</th><th className="px-2">DISCOUNT</th><th className="px-3 text-right">AMOUNT</th><th className="w-10" /></tr></thead><tbody>{items.map((item) => <InvoiceItemRow key={item.id} item={item} catalog={catalog} onChange={updateItem} onRemove={() => setItems((current) => current.length > 1 ? current.filter((entry) => entry.id !== item.id) : current)} onEnter={appendRow} />)}</tbody></table></div>
+        {errors && !hasDescription && <p className="mt-2 text-xs text-destructive">Add an item description and quantity.</p>}
+        <div className="mt-4"><Button type="button" variant="outline" size="sm" onClick={appendRow}><Plus className="size-4" /> Add Item</Button></div>
+      </Section>
+      <div className="grid gap-5 xl:grid-cols-2"><Section title="Customer Notes"><Textarea value={customerNotes} onChange={(event) => setCustomerNotes(event.target.value)} className="min-h-24 resize-y" /><div className="mt-5"><label className="mb-2 block text-sm font-medium">Terms &amp; Conditions</label><Textarea value={invoiceTerms} onChange={(event) => setInvoiceTerms(event.target.value)} placeholder="Enter terms and conditions" className="min-h-24 resize-y" /></div></Section><Section title="Invoice Summary"><TotalsPanel subtotal={subtotal} taxPercent={taxPercent} setTaxPercent={setTaxPercent} taxAmount={taxAmount} discount={discount} setDiscount={setDiscount} discountMode={discountMode} setDiscountMode={setDiscountMode} shipping={shipping} setShipping={setShipping} adjustment={adjustment} setAdjustment={setAdjustment} withholdingAmount={withholdingAmount} setWithholdingAmount={setWithholdingAmount} withholdingType={withholdingType} setWithholdingType={setWithholdingType} total={payableTotal} amountReceived={mode === 'edit' ? Number(editingInvoice?.amountPaid) || 0 : receivedPayment ? Number(receivedAmount) || 0 : 0} balanceDue={Math.max(0, payableTotal - (mode === 'edit' ? Number(editingInvoice?.amountPaid) || 0 : receivedPayment ? Number(receivedAmount) || 0 : 0))} /></Section></div>
+      {mode === 'create' && <Section title="Payment Received">
+        <label className="flex items-center gap-2 text-sm font-medium"><Checkbox checked={receivedPayment} onCheckedChange={(checked) => { setReceivedPayment(checked === true); if (checked === true) { setReceivedAmount(payableTotal.toFixed(2)); setReceivedAmountEdited(false); void getPaymentNumberPreview().then((preview) => { setReceivedPaymentNumber(preview.paymentNumber); setPaymentAutoGenerate(preview.settings.autoGenerate); }).catch((error) => toast.error(error instanceof Error ? error.message : 'Could not load payment number preferences.')); } }} />I have received the payment</label>
+        {receivedPayment && <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3"><Field label="Amount Received" required><Input type="number" min="0.01" max={payableTotal} step="0.01" value={receivedAmount} onChange={(event) => { setReceivedAmount(event.target.value); setReceivedAmountEdited(true); }} /></Field><Field label="Balance Due"><Input readOnly value={currency(Math.max(0, payableTotal - (Number(receivedAmount) || 0)))} /></Field><Field label="Payment Mode" required><select value={receivedMode} onChange={(event) => setReceivedMode(event.target.value)} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option>UPI</option><option>Bank Transfer</option><option>Cash</option><option>Cheque</option><option>Card</option><option>Other</option></select></Field><Field label="Deposit To"><Input value={receivedDepositTo} onChange={(event) => setReceivedDepositTo(event.target.value)} placeholder="Bank or cash account" /></Field><Field label="Payment Date" required><Input type="date" value={receivedDate} onChange={(event) => setReceivedDate(event.target.value)} /></Field><Field label="Reference #"><Input value={receivedReference} onChange={(event) => setReceivedReference(event.target.value)} /></Field>{!paymentAutoGenerate && <Field label="Payment #" required><div className="flex gap-2"><Input value={receivedPaymentNumber} onChange={(event) => setReceivedPaymentNumber(event.target.value)} /><Button type="button" variant="outline" size="icon" aria-label="Payment number settings" onClick={() => setPaymentSettingsOpen(true)}><Settings2 className="size-4" /></Button></div></Field>}</div>}
+      </Section>}
+      <div className="flex justify-end"><Link href={leaveDestination} className="text-xs text-muted-foreground hover:text-foreground">{mode === 'edit' ? 'Return to invoice' : 'Return to invoices'}</Link></div>
+    </div>
+    <footer className="sticky bottom-0 z-10 -mx-4 mt-6 flex flex-wrap items-center justify-between gap-3 border-t bg-background/95 px-4 py-3 backdrop-blur sm:-mx-6 sm:px-6 lg:-mx-8 lg:px-8"><div className="flex flex-wrap items-center gap-2">{mode === 'edit' ? <Button type="button" onClick={() => void saveInvoice('DRAFT')} disabled={busy}>{busy ? 'Saving…' : 'Save Changes'}</Button> : <><Button type="button" variant="outline" onClick={() => void saveInvoice('DRAFT')} disabled={busy}>{busy ? 'Saving…' : 'Save as Draft'}</Button><Button type="button" onClick={() => void saveInvoice('SENT')} disabled={busy}>{busy ? 'Saving…' : 'Save and Send'}</Button></>}<Button type="button" variant="ghost" onClick={() => askLeave(leaveDestination)}>Cancel</Button></div></footer>
+    <Dialog open={preferencesOpen} onOpenChange={setPreferencesOpen}><DialogContent><DialogHeader><DialogTitle>Invoice Number Preferences</DialogTitle><DialogDescription>Choose how invoice numbers are assigned.</DialogDescription></DialogHeader><div className="space-y-3 py-2"><label className="flex cursor-pointer items-start gap-3 rounded-md border p-3"><input type="radio" checked={numberMode === 'auto'} onChange={() => setNumberMode('auto')} /><span><span className="block text-sm font-medium">Auto-generate</span><span className="text-xs text-muted-foreground">Numbers are assigned automatically.</span></span></label><label className="flex cursor-pointer items-start gap-3 rounded-md border p-3"><input type="radio" checked={numberMode === 'manual'} onChange={() => setNumberMode('manual')} /><span><span className="block text-sm font-medium">Enter manually</span><span className="text-xs text-muted-foreground">Set the invoice number for this invoice.</span></span></label></div><DialogFooter><Button type="button" onClick={() => setPreferencesOpen(false)}>Done</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={sendOpen} onOpenChange={setSendOpen}><DialogContent><DialogHeader><DialogTitle>Send Invoice</DialogTitle><DialogDescription>Invoice {invoiceNumber} is saved as a draft. Send the PDF to the customer.</DialogDescription></DialogHeader><div className="space-y-3 py-2"><Field label="To"><Input type="email" value={sendEmail} onChange={(event) => setSendEmail(event.target.value)} placeholder="customer@example.com" /></Field><Field label="Subject"><Input value={`Invoice ${invoiceNumber}`} readOnly /></Field></div><DialogFooter><Button type="button" variant="outline" onClick={() => { setSendOpen(false); if (createdId) router.push(`/invoices/${createdId}`); }}>Send later</Button><Button type="button" disabled={busy || !sendEmail.trim()} onClick={async () => { if (!createdId) return; setBusy(true); try { await sendInvoiceEmail(createdId, sendEmail.trim()); toast.success('Invoice emailed with the PDF attached.'); setSendOpen(false); router.push(`/invoices/${createdId}`); } catch (error) { toast.error(error instanceof Error ? error.message : 'Could not send invoice.'); } finally { setBusy(false); } }}>{busy ? 'Sending…' : 'Send with PDF'}</Button></DialogFooter></DialogContent></Dialog>
+    <RequiredCapacitiesDialog open={capacitiesOpen} onOpenChange={setCapacitiesOpen} capacities={requiredCapacities} onSelectCapacity={handleSelectCapacity} />
+    <InvoiceItemScanner open={scannerOpen} onOpenChange={setScannerOpen} onScan={handleScannedItem} />
+    <PaymentNumberSettingsDialog open={paymentSettingsOpen} onOpenChange={setPaymentSettingsOpen} onSaved={(settings) => { setPaymentAutoGenerate(settings.autoGenerate); void getPaymentNumberPreview().then((preview) => setReceivedPaymentNumber(preview.paymentNumber)); }} />
+    <NewCustomerDialog open={newCustomerOpen} onOpenChange={setNewCustomerOpen} onCreated={(created) => { setCustomers((current) => [...current.filter((entry) => entry.id !== created.id), created].sort((a, b) => a.name.localeCompare(b.name))); setCustomer(created); setGstin(created.gstin); }} />
+  </PageContainer>;
+}
+
+function RequiredCapacitiesDialog({
+  open,
+  onOpenChange,
+  capacities,
+  onSelectCapacity,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  capacities: RequiredCapacity[];
+  onSelectCapacity: (capacity: RequiredCapacity) => void;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+        <DialogHeader>
+          <div className="flex items-center gap-2.5">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/10 text-amber-600">
+              <Zap className="size-5 fill-amber-500" />
+            </div>
+            <div>
+              <DialogTitle className="text-base font-semibold">
+                Required Capacities (Admin Data Management)
+              </DialogTitle>
+              <DialogDescription className="text-xs">
+                Solar system capacities configured in Admin &gt; Data Management. Select to add directly to this invoice.
+              </DialogDescription>
+            </div>
+          </div>
+        </DialogHeader>
+
+        <div className="space-y-3 py-2">
+          {capacities.length === 0 ? (
+            <div className="rounded-lg border border-dashed p-8 text-center space-y-2">
+              <p className="text-sm font-medium">No Required Capacities configured yet.</p>
+              <p className="text-xs text-muted-foreground">
+                Capacities created by the admin in Admin &gt; Data Management will appear here.
+              </p>
+              <Link
+                href="/admin/data-management"
+                className="mt-2 inline-flex items-center text-xs text-primary font-medium hover:underline"
+              >
+                Go to Admin Data Management &rarr;
+              </Link>
+            </div>
+          ) : (
+            <div className="grid gap-3">
+              {capacities.map((cap) => {
+                const grandTotal = cap.grandTotal || cap.courseFee + cap.admissionFee;
+                return (
+                  <div
+                    key={cap.id}
+                    className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-lg border bg-card p-3.5 hover:border-primary/50 transition-colors"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-sm text-foreground">{cap.name}</span>
+                        {cap.brand && (
+                          <span className="rounded bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+                            {cap.brand} Panels
+                          </span>
+                        )}
+                        {cap.afterSubsidy && (
+                          <span className="rounded bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 px-2 py-0.5 text-[11px] font-medium">
+                            After Subsidy: {currency(cap.afterSubsidy)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-muted-foreground flex flex-wrap gap-x-4 gap-y-1">
+                        <span>System Price: <strong className="text-foreground">{currency(cap.courseFee)}</strong></span>
+                        {cap.admissionFee > 0 && (
+                          <span>KSEB Fee: <strong className="text-foreground">{currency(cap.admissionFee)}</strong></span>
+                        )}
+                        <span>Grand Total: <strong className="text-primary font-semibold">{currency(grandTotal)}</strong></span>
+                      </div>
+                      {cap.description && (
+                        <p className="text-xs text-muted-foreground/80 line-clamp-1">{cap.description}</p>
+                      )}
+                    </div>
+
+                    <Button type="button" size="sm" onClick={() => onSelectCapacity(cap)} className="shrink-0 text-xs h-8">
+                      + Add ({currency(grandTotal)})
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="flex justify-between items-center pt-2 border-t text-xs text-muted-foreground">
+            <span>Configured in Admin Data Management</span>
+            <Link href="/admin/data-management" className="text-primary hover:underline">
+              Manage Capacities &rarr;
+            </Link>
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            Close
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function InvoiceItemScanner({ open, onOpenChange, onScan }: { open: boolean; onOpenChange: (open: boolean) => void; onScan: (value: string) => boolean }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [scanValue, setScanValue] = useState('');
+  const [cameraMessage, setCameraMessage] = useState('Starting camera…');
+
+  useEffect(() => {
+    if (!open) return;
+    let stopped = false;
+    let stream: MediaStream | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const setup = async () => {
+      const detectorWindow = window as Window & { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> } };
+      if (!detectorWindow.BarcodeDetector || !navigator.mediaDevices?.getUserMedia) {
+        setCameraMessage('Camera barcode scanning is unavailable in this browser. Use a USB scanner in the field below.');
+        return;
+      }
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+        if (stopped || !videoRef.current) { stream.getTracks().forEach((track) => track.stop()); return; }
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        setCameraMessage('Point the camera at a catalog barcode.');
+        const detector = new detectorWindow.BarcodeDetector();
+        const scan = async () => {
+          if (stopped || !videoRef.current) return;
+          try {
+            const results = await detector.detect(videoRef.current);
+            if (results[0]?.rawValue) {
+              if (onScan(results[0].rawValue)) onOpenChange(false);
+              else setCameraMessage('This code did not match an active catalog item. Use the field below to enter an item name or ID.');
+              return;
+            }
+          } catch { setCameraMessage('Could not read the barcode. Try again or use a USB scanner.'); }
+          timer = setTimeout(() => void scan(), 300);
+        };
+        void scan();
+      } catch {
+        setCameraMessage('Camera access is unavailable. Use a USB scanner in the field below.');
+      }
+    };
+    void setup();
+    return () => { stopped = true; if (timer) clearTimeout(timer); stream?.getTracks().forEach((track) => track.stop()); };
+  }, [open, onOpenChange, onScan]);
+
+  const submit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!scanValue.trim()) return;
+    if (!onScan(scanValue)) return;
+    setScanValue('');
+    onOpenChange(false);
+  };
+  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogHeader><DialogTitle>Scan invoice item</DialogTitle><DialogDescription>Scan a catalog item barcode. The current product catalog matches scans by item name or ID.</DialogDescription></DialogHeader><div className="space-y-3"><video ref={videoRef} muted playsInline className="aspect-video w-full rounded-md bg-muted object-cover" /><p className="text-xs text-muted-foreground">{cameraMessage}</p><form onSubmit={submit} className="flex gap-2"><Input autoFocus value={scanValue} onChange={(event) => setScanValue(event.target.value)} placeholder="USB scanner input or product item name / ID" /><Button type="submit">Add item</Button></form><p className="text-xs text-muted-foreground">This catalog does not store separate SKU or barcode values. Scanned codes must currently equal a product name or ID.</p></div></DialogContent></Dialog>;
+}
+
+function FieldLabel({ children, required = false }: { children: React.ReactNode; required?: boolean }) { return <div className="mb-2 text-sm font-medium">{children}{required && <span className="ml-1 text-destructive" title="Required">*</span>}</div>; }
+function Field({ label, children, required = false, className = '' }: { label: string; children: React.ReactNode; required?: boolean; className?: string }) { return <div className={`grid gap-2 sm:grid-cols-[minmax(110px,0.55fr)_minmax(0,1.45fr)] sm:items-start ${className}`}><div className="pt-2"><FieldLabel required={required}>{label}</FieldLabel></div><div>{children}</div></div>; }
+function DateInput({ date, onChange, clearable = false }: { date: Date | null; onChange: (date: Date | null) => void; clearable?: boolean }) { return <Popover><PopoverTrigger asChild><Button type="button" variant="outline" className="h-9 w-full justify-start font-normal"><CalendarDays className="mr-2 size-4 text-muted-foreground" />{date ? format(date, 'dd MMM yyyy') : 'No due date'}</Button></PopoverTrigger><PopoverContent className="w-auto p-0" align="start"><Calendar mode="single" selected={date || undefined} onSelect={(selected) => onChange(selected || null)} />{clearable && date && <div className="border-t p-2"><Button type="button" variant="ghost" size="sm" className="w-full" onClick={() => onChange(null)}>Clear due date</Button></div>}</PopoverContent></Popover>; }
+
+function NewCustomerDialog({ open, onOpenChange, onCreated }: { open: boolean; onOpenChange: (open: boolean) => void; onCreated: (customer: Customer) => void }) {
+  const [saving, setSaving] = useState(false);
+  const [form, setForm] = useState({ name: '', email: '', phone: '', address: '', state: '', gstin: '' });
+
+  const update = (key: keyof typeof form, value: string) => setForm((current) => ({ ...current, [key]: value }));
+  const save = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      const created = await createInvoiceCustomerRequest(form);
+      const customer: Customer = {
+        id: created.id,
+        name: created.name,
+        email: created.email ?? '',
+        phone: created.phone ?? '',
+        address: created.address ?? '',
+        state: created.state ?? '',
+        gstin: created.gstin ?? '',
+        savedCustomer: true,
+      };
+      onCreated(customer);
+      setForm({ name: '', email: '', phone: '', address: '', state: '', gstin: '' });
+      onOpenChange(false);
+      toast.success('Customer added.');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not create customer.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <Dialog open={open} onOpenChange={(nextOpen) => { if (!saving) onOpenChange(nextOpen); }}>
+    <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
+      <DialogHeader><DialogTitle>New Customer</DialogTitle><DialogDescription>Add a customer to the invoice directory. GST details are optional.</DialogDescription></DialogHeader>
+      <form onSubmit={(event) => void save(event)} className="space-y-4">
+        <Field label="Customer Name" required><Input autoFocus required maxLength={160} value={form.name} onChange={(event) => update('name', event.target.value)} placeholder="Name or business name" /></Field>
+        <Field label="Email"><Input type="email" maxLength={254} value={form.email} onChange={(event) => update('email', event.target.value)} placeholder="name@example.com" /></Field>
+        <Field label="Phone"><Input type="tel" maxLength={32} value={form.phone} onChange={(event) => update('phone', event.target.value)} placeholder="Phone number" /></Field>
+        <Field label="Billing Address"><Textarea maxLength={1000} value={form.address} onChange={(event) => update('address', event.target.value)} placeholder="Street, city, postal code" /></Field>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="State"><Input maxLength={80} value={form.state} onChange={(event) => update('state', event.target.value)} placeholder="State" /></Field>
+          <Field label="GSTIN (optional)"><Input maxLength={32} value={form.gstin} onChange={(event) => update('gstin', event.target.value)} placeholder="GSTIN" /></Field>
+        </div>
+        <DialogFooter><Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>Cancel</Button><Button type="submit" disabled={saving || !form.name.trim()}>{saving ? 'Saving…' : 'Save Customer'}</Button></DialogFooter>
+      </form>
+    </DialogContent>
+  </Dialog>;
+}

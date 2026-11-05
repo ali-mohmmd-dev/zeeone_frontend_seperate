@@ -1,0 +1,163 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { SESSION_MESSAGES } from '@/lib/session-logout';
+import { PermissionCheckLoader } from '@/components/auth/permission-check-loader';
+import { useRouter } from 'next/navigation';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { useForm } from 'react-hook-form';
+import { loginSchema } from '@/schema/user-schema';
+import { Button } from '@/components/ui/button';
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form';
+import { Input } from '@/components/ui/input';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { ErrorMessage } from '@/components/ui/error-message';
+
+import type { LoginData } from '@/types/auth';
+
+type LoginFormData = LoginData;
+
+export function LoginForm({ logoutReason }: { logoutReason?: string }) {
+  const logoutMessage = logoutReason === 'access-denied' || logoutReason === 'session-expired'
+    ? SESSION_MESSAGES[logoutReason] : null;
+
+  useEffect(() => {
+    if (!logoutMessage) return;
+    // The route handler clears cookies, including HttpOnly authentication cookies.
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+  }, [logoutMessage]);
+  const router = useRouter();
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isCheckingPermissions, setIsCheckingPermissions] = useState(false);
+
+  const form = useForm<LoginFormData>({
+    resolver: zodResolver(loginSchema),
+    defaultValues: {
+      email: '',
+      password: '',
+    },
+  });
+
+  const onSubmit = async (data: LoginFormData) => {
+    setIsLoading(true);
+    setIsCheckingPermissions(false);
+    setErrorMessage(null);
+    try {
+      const res = await fetch('/api/v1/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email: data.email.toLowerCase().trim(),
+          password: data.password,
+        }),
+      });
+
+      const json = await res.json();
+
+      if (!res.ok || !json.success) {
+        setErrorMessage(json.error?.message || json.message || 'Invalid email or password');
+        setIsLoading(false);
+        return;
+      }
+
+      const { user, token } = json.data;
+
+      // Save token & user in localStorage & browser cookies
+      if (token) {
+        localStorage.setItem('token', token);
+        document.cookie = `token=${token}; path=/; max-age=604800; SameSite=Lax`;
+      }
+      if (user) {
+        localStorage.setItem('user', JSON.stringify(user));
+        document.cookie = `user=${encodeURIComponent(JSON.stringify(user))}; path=/; max-age=604800; SameSite=Lax`;
+      }
+
+      setIsCheckingPermissions(true);
+      router.replace('/dashboard');
+    } catch (err: any) {
+      setErrorMessage(err.message || 'An unexpected error occurred connecting to backend');
+      setIsLoading(false);
+    }
+  };
+
+  if (isLoading) {
+    return <PermissionCheckLoader message={isCheckingPermissions ? 'Checking your access…' : 'Signing you in…'} />;
+  }
+
+  return (
+    <Card className="w-full max-w-md">
+      <CardHeader className="space-y-1">
+        <CardTitle className="text-2xl font-bold text-center">Sign in to CRM</CardTitle>
+        <CardDescription className="text-center">
+          Enter your email and password to access your account
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {logoutMessage && (
+          <div role="alert" className="mb-4 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+            {logoutMessage}
+          </div>
+        )}
+        <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+            <FormField
+              control={form.control}
+              name="email"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Email</FormLabel>
+                  <FormControl>
+                    <Input
+                      placeholder="Enter your email"
+                      type="email"
+                      autoComplete="email"
+                      disabled={isLoading}
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="password"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Password</FormLabel>
+                  <FormControl>
+                    <Input
+                      placeholder="Enter your password"
+                      type="password"
+                      autoComplete="current-password"
+                      disabled={isLoading}
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <ErrorMessage message={errorMessage} />
+
+            <Button type="submit" className="w-full" disabled={isLoading}>
+              {isLoading ? 'Signing in...' : 'Sign in'}
+            </Button>
+          </form>
+        </Form>
+      </CardContent>
+    </Card>
+  );
+}
